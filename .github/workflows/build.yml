@@ -1,0 +1,248 @@
+name: Build and package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: powershell
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: windows-2022
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      artifact-prefix: ${{ steps.version.outputs.artifact-prefix }}
+    steps:
+      - name: Validate version and source revision
+        id: version
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_SHA -cnotmatch '\A[0-9a-f]{40}\z') {
+              throw 'The source revision must be a full commit SHA.'
+          }
+
+          $version = "0.1.0-ci.$($env:GITHUB_RUN_NUMBER)"
+          $release = 'false'
+          $prerelease = 'true'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+              $identifier = '(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+              $semver = '\Av(?<major>0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)' +
+                  '(?:-(?<prerelease>' + $identifier + '(?:\.' + $identifier + ')*))?' +
+                  '(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z'
+              $match = [regex]::Match($env:GITHUB_REF_NAME, $semver)
+              if (-not $match.Success) {
+                  throw "Invalid release tag '$($env:GITHUB_REF_NAME)'. Expected v followed by a SemVer 2.0 version."
+              }
+              $version = $env:GITHUB_REF_NAME.Substring(1)
+              if ($match.Groups['major'].Value -ne '0' -and -not $match.Groups['prerelease'].Success) {
+                  $prerelease = 'false'
+              }
+              if ($env:GITHUB_EVENT_NAME -eq 'push') {
+                  $release = 'true'
+              }
+          }
+          # Keep successful matrix artifacts addressable when only failed jobs are rerun.
+          $artifactPrefix = "RdpProxy-$($env:GITHUB_SHA)-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@(
+              "version=$version", "release=$release", "prerelease=$prerelease", "artifact-prefix=$artifactPrefix"
+          ), (New-Object System.Text.UTF8Encoding($false)))
+
+  build:
+    name: Build ${{ matrix.variant }}
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [full, small]
+    env:
+      PACKAGE_VERSION: ${{ needs.version.outputs.version }}
+      PACKAGE_VARIANT: ${{ matrix.variant }}
+      BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: global.json
+          architecture: x64
+          cache: false
+
+      - name: Build and package
+        id: package
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $sdkVersion = (& dotnet --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine the .NET SDK version.' }
+          $expectedSdk = (Get-Content -LiteralPath '.\global.json' -Raw | ConvertFrom-Json).sdk.version
+          if ($sdkVersion -ne $expectedSdk) { throw "Expected SDK $expectedSdk, got $sdkVersion." }
+
+          $prefix = "rdpproxy-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)-$($env:PACKAGE_VARIANT)"
+          $publishDirectory = Join-Path $env:RUNNER_TEMP "$prefix-publish"
+          $packageDirectory = Join-Path $env:RUNNER_TEMP "$prefix-packages"
+          if ((Test-Path -LiteralPath $publishDirectory) -or (Test-Path -LiteralPath $packageDirectory)) {
+              throw 'Build output paths must be new for this job.'
+          }
+          $buildParameters = @{
+              WorkRoot = $env:RUNNER_TEMP
+              OutputDirectory = $publishDirectory
+              Version = $env:PACKAGE_VERSION
+              SourceRevision = $env:GITHUB_SHA
+          }
+          if ($env:PACKAGE_VARIANT -eq 'small') {
+              $buildParameters.FrameworkDependent = $true
+          }
+          & .\Build.ps1 @buildParameters
+          & .\Package.ps1 -PublishDirectory $publishDirectory -OutputDirectory $packageDirectory `
+              -Version $env:PACKAGE_VERSION -Variant $env:PACKAGE_VARIANT -SourceRevision $env:GITHUB_SHA `
+              -Repository 'https://github.com/alexhmt/proxy-over-rdp' -RunUrl $env:BUILD_RUN_URL -SdkVersion $sdkVersion
+
+          $archiveName = "RdpProxy-$($env:PACKAGE_VERSION)-win-x64-$($env:PACKAGE_VARIANT).zip"
+          [System.IO.File]::AppendAllLines($env:GITHUB_OUTPUT, [string[]]@(
+              "archive=$(Join-Path $packageDirectory $archiveName)",
+              "checksum=$(Join-Path $packageDirectory ($archiveName + '.sha256'))"
+          ), (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Upload package and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.version.outputs.artifact-prefix }}-${{ matrix.variant }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: false
+
+  release:
+    name: Create draft release
+    needs: [version, build]
+    if: >-
+      github.repository == 'alexhmt/proxy-over-rdp' &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/') &&
+      needs.version.outputs.release == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      PACKAGE_VERSION: ${{ needs.version.outputs.version }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_PRERELEASE: ${{ needs.version.outputs.prerelease }}
+      BUILD_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Check out release source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag still matches this build and belongs to main
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          & git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main' "+refs/tags/$($env:RELEASE_TAG):refs/tags/$($env:RELEASE_TAG)"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the release tag and main branch.' }
+          $tagCommit = (& git rev-parse "refs/tags/$($env:RELEASE_TAG)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -cne $env:GITHUB_SHA) {
+              throw 'The remote tag no longer points to the source revision built by this run.'
+          }
+          & git merge-base --is-ancestor $env:GITHUB_SHA refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'The release commit must be an ancestor of main.' }
+
+      # Omitting github-token keeps both downloads scoped to this workflow run.
+      - name: Download full package from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.version.outputs.artifact-prefix }}-full
+          path: ${{ runner.temp }}/release-assets
+          digest-mismatch: error
+
+      - name: Download small package from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.version.outputs.artifact-prefix }}-small
+          path: ${{ runner.temp }}/release-assets
+          digest-mismatch: error
+
+      - name: Create draft with both packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIRECTORY: ${{ runner.temp }}/release-assets
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $assets = @()
+          foreach ($variant in @('full', 'small')) {
+              $archiveName = "RdpProxy-$($env:PACKAGE_VERSION)-win-x64-$variant.zip"
+              $archive = Join-Path $env:RELEASE_DIRECTORY $archiveName
+              $checksum = "$archive.sha256"
+              if (-not (Test-Path -LiteralPath $archive -PathType Leaf) -or -not (Test-Path -LiteralPath $checksum -PathType Leaf)) {
+                  throw "Missing package or checksum for $variant."
+              }
+              $checksumText = (Get-Content -LiteralPath $checksum -Raw).Trim()
+              $checksumPattern = '\A(?<hash>[0-9a-fA-F]{64}) [ *]' + [regex]::Escape($archiveName) + '\z'
+              $match = [regex]::Match($checksumText, $checksumPattern)
+              if (-not $match.Success -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $match.Groups['hash'].Value) {
+                  throw "Package checksum does not match for $variant."
+              }
+              $assets += $archive, $checksum
+          }
+          if (@(Get-ChildItem -LiteralPath $env:RELEASE_DIRECTORY -File).Count -ne 4) {
+              throw 'Expected exactly two archives and their two checksum files.'
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $notes = @(
+              "Source revision: [$($env:GITHUB_SHA)](https://github.com/$($env:GITHUB_REPOSITORY)/commit/$($env:GITHUB_SHA))",
+              "Build: $($env:BUILD_RUN_URL)",
+              '',
+              '- full: includes the .NET runtime.',
+              '- small: requires the .NET 8 Desktop Runtime (x64).',
+              '- Each archive has a SHA-256 checksum file.'
+          )
+          [System.IO.File]::WriteAllLines($notesPath, [string[]]$notes, (New-Object System.Text.UTF8Encoding($false)))
+          $arguments = @('release', 'create', $env:RELEASE_TAG) + $assets + @(
+              '--repo', $env:GITHUB_REPOSITORY, '--verify-tag', '--draft', '--latest=false',
+              '--title', "RdpProxy $($env:PACKAGE_VERSION)", '--notes-file', $notesPath
+          )
+          if ($env:RELEASE_PRERELEASE -eq 'true') { $arguments += '--prerelease' }
+          # Creation fails if a release already exists; existing assets are preserved.
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed. Existing release assets were not overwritten.' }

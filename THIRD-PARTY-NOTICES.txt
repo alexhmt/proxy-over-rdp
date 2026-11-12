@@ -1,0 +1,23 @@
+RdpProxy — сведения об использованном коде
+
+RdpProxy использует основу транспорта динамического виртуального канала RDP
+из проекта RdpPsBridge. Структура WTS- и COM-адаптеров и обработка отложенного
+чтения сервера адаптированы из этого проекта.
+
+Сохранённое уведомление об авторских правах:
+Copyright (c) 2026 RdpPsBridge contributors
+Лицензия MIT приведена в LICENSE.txt.
+
+COM interop, фабрика классов и LocalServer происходят из проекта Microsoft
+rdp-dvc-plugin-samples, распространяемого по лицензии MIT.
+Источник: https://github.com/microsoft/rdp-dvc-plugin-samples
+Коммит: d71d3689f2b63d2ea052b765d6ac792ec6dbbc9e
+Скопированные и адаптированные файлы в src/Client:
+DvcInterfaces.cs, NativeMethods.cs, SimpleClassFactory.cs, LocalServer.cs.
+
+Copyright (c) Microsoft Corporation.
+Лицензия Microsoft сохранена в LICENSE-Microsoft.txt.
+
+Полный архив включает .NET Desktop Runtime. Если публикация runtime
+содержит файлы лицензий и уведомлений, упаковка сохраняет их без изменений
+в bin/win-x64 вместе с остальными файлами runtime.
