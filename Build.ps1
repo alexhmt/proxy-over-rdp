@@ -99,6 +99,86 @@ function Merge-PublishTree {
     }
 }
 
+function Copy-RuntimeNotices {
+    param([string]$WorkDirectory, [string]$PublishDirectory)
+    $runtimePackages = [ordered]@{
+        'Microsoft.NETCore.App' = 'Microsoft.NETCore.App.Runtime.win-x64'
+        'Microsoft.WindowsDesktop.App' = 'Microsoft.WindowsDesktop.App.Runtime.win-x64'
+    }
+    $frameworkVersions = @{}
+    $cacheRoots = @()
+    foreach ($side in @('Client', 'Server')) {
+        $configPath = Join-Path $PublishDirectory ('RdpProxy.' + $side + '.runtimeconfig.json')
+        $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        $frameworkProperty = $config.runtimeOptions.PSObject.Properties['includedFrameworks']
+        if ($null -eq $frameworkProperty) { throw "Missing includedFrameworks in $configPath" }
+        $frameworks = @($frameworkProperty.Value)
+        foreach ($name in $runtimePackages.Keys) {
+            $frameworkMatches = @($frameworks | Where-Object { $_.name -ceq $name })
+            if ($frameworkMatches.Count -ne 1 -or [string]$frameworkMatches[0].version -cnotmatch '^8\.[0-9]+\.[0-9]+\z') {
+                throw "Expected exactly one $name version 8.x in $configPath"
+            }
+            $runtimeVersion = [string]$frameworkMatches[0].version
+            if ($frameworkVersions.ContainsKey($name) -and $frameworkVersions[$name] -cne $runtimeVersion) {
+                throw "Client/server framework version mismatch: $name"
+            }
+            $frameworkVersions[$name] = $runtimeVersion
+        }
+        $assetsPath = Join-Path $WorkDirectory ('src\' + $side + '\obj\project.assets.json')
+        if (Test-Path -LiteralPath $assetsPath -PathType Leaf) {
+            $assets = Get-Content -LiteralPath $assetsPath -Raw | ConvertFrom-Json
+            $foldersProperty = $assets.PSObject.Properties['packageFolders']
+            if ($null -ne $foldersProperty) {
+                foreach ($folder in $foldersProperty.Value.PSObject.Properties) { $cacheRoots += $folder.Name }
+            }
+        }
+    }
+    if ($env:NUGET_PACKAGES) {
+        $environmentCache = $env:NUGET_PACKAGES
+        if (-not [System.IO.Path]::IsPathRooted($environmentCache)) {
+            $environmentCache = Join-Path $WorkDirectory $environmentCache
+        }
+        $cacheRoots += $environmentCache
+    }
+    $userProfilePath = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    if ($userProfilePath) { $cacheRoots += Join-Path $userProfilePath '.nuget\packages' }
+    $cacheRoots = @($cacheRoots | Select-Object -Unique)
+    foreach ($name in $runtimePackages.Keys) {
+        $packageId = $runtimePackages[$name]
+        $packagePath = $packageId.ToLowerInvariant() + '\' + $frameworkVersions[$name]
+        $packageDirectory = $null
+        $noticeSources = $null
+        foreach ($cacheRoot in $cacheRoots) {
+            $candidate = Join-Path $cacheRoot $packagePath
+            $licenseName = $null
+            foreach ($candidateName in @('LICENSE.TXT', 'LICENSE')) {
+                if (Test-Path -LiteralPath (Join-Path $candidate $candidateName) -PathType Leaf) {
+                    $licenseName = $candidateName
+                    break
+                }
+            }
+            if (-not $licenseName) { continue }
+            $hasThirdPartyNotices = Test-Path -LiteralPath (Join-Path $candidate 'THIRD-PARTY-NOTICES.TXT') -PathType Leaf
+            if ($name -ceq 'Microsoft.NETCore.App' -and -not $hasThirdPartyNotices) { continue }
+            $packageDirectory = $candidate
+            $noticeSources = [ordered]@{ 'LICENSE.txt' = $licenseName }
+            if ($hasThirdPartyNotices) { $noticeSources['THIRD-PARTY-NOTICES.txt'] = 'THIRD-PARTY-NOTICES.TXT' }
+            break
+        }
+        if (-not $packageDirectory) {
+            throw "Missing license/notices for restored runtime package $packageId/$($frameworkVersions[$name]). Restore that exact package and retry."
+        }
+        $destination = Join-Path $PublishDirectory ('runtime-licenses\' + $packageId.ToLowerInvariant())
+        $null = [System.IO.Directory]::CreateDirectory($destination)
+        foreach ($noticeName in $noticeSources.Keys) {
+            $noticePath = Join-Path $packageDirectory $noticeSources[$noticeName]
+            Assert-PlainPath -Path $noticePath
+            if ((Get-Item -LiteralPath $noticePath).Length -eq 0) { throw "Empty runtime notice: $noticePath" }
+            [System.IO.File]::Copy($noticePath, (Join-Path $destination $noticeName), $false)
+        }
+    }
+}
+
 $semVerPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\z'
 if ($Version -cnotmatch $semVerPattern) { throw 'Version must be a SemVer 2.0 version without a v prefix.' }
 if ($SourceRevision -and $SourceRevision -cnotmatch '^[0-9a-fA-F]{40}\z') {
@@ -167,6 +247,9 @@ try {
     $merged = Join-Path $work 'merged'
     foreach ($side in @('Client', 'Server')) {
         Merge-PublishTree -Source (Join-Path $work ('publish\' + $side)) -Destination $merged
+    }
+    if (-not $FrameworkDependent) {
+        Copy-RuntimeNotices -WorkDirectory $work -PublishDirectory $merged
     }
     Assert-EmptyDirectory -Path $output
     $null = [System.IO.Directory]::CreateDirectory($output)

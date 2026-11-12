@@ -168,6 +168,19 @@ else {
     foreach ($name in $runtimeFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $publish $name) -PathType Leaf)) { throw "Missing bundled runtime file: $name" }
     }
+    foreach ($packageId in @('microsoft.netcore.app.runtime.win-x64', 'microsoft.windowsdesktop.app.runtime.win-x64')) {
+        $noticeNames = @('LICENSE.txt')
+        $thirdPartyPath = Join-Path $publish ('runtime-licenses\' + $packageId + '\THIRD-PARTY-NOTICES.txt')
+        if ($packageId -ceq 'microsoft.netcore.app.runtime.win-x64' -or (Test-Path -LiteralPath $thirdPartyPath)) {
+            $noticeNames += 'THIRD-PARTY-NOTICES.txt'
+        }
+        foreach ($noticeName in $noticeNames) {
+            $noticePath = Join-Path $publish ('runtime-licenses\' + $packageId + '\' + $noticeName)
+            if (-not (Test-Path -LiteralPath $noticePath -PathType Leaf) -or (Get-Item -LiteralPath $noticePath).Length -eq 0) {
+                throw "Missing or empty bundled runtime notice: $packageId/$noticeName"
+            }
+        }
+    }
 }
 $expectedProductVersion = if ($Version.Contains('+')) { $Version + '.' + $SourceRevision } else { $Version + '+' + $SourceRevision }
 $frameworkVersions = $null

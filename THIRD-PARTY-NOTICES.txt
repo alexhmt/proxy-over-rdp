@@ -18,6 +18,7 @@ DvcInterfaces.cs, NativeMethods.cs, SimpleClassFactory.cs, LocalServer.cs.
 Copyright (c) Microsoft Corporation.
 Лицензия Microsoft сохранена в LICENSE-Microsoft.txt.
 
-Полный архив включает .NET Desktop Runtime. Если публикация runtime
-содержит файлы лицензий и уведомлений, упаковка сохраняет их без изменений
-в bin/win-x64 вместе с остальными файлами runtime.
+Полный архив включает .NET Desktop Runtime. Лицензии точных восстановленных
+runtime-пакетов и уведомления о сторонних компонентах .NET Core находятся в
+bin/win-x64/runtime-licenses/. Уведомления Windows Desktop включаются,
+если они предоставлены соответствующим runtime-пакетом.
